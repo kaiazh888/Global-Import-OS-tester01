@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
+import traceback
 
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -18,33 +19,38 @@ DEFAULT_COLUMNS = [
 
 def init_data():
     if not CASES_FILE.exists():
-        df = pd.DataFrame(columns=DEFAULT_COLUMNS)
-        df.to_csv(CASES_FILE, index=False)
+        pd.DataFrame(columns=DEFAULT_COLUMNS).to_csv(CASES_FILE, index=False)
 
 def load_cases():
     init_data()
-    return pd.read_csv(CASES_FILE)
+    try:
+        return pd.read_csv(CASES_FILE)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=DEFAULT_COLUMNS)
 
 def save_cases(df):
+    df = df[DEFAULT_COLUMNS]
     df.to_csv(CASES_FILE, index=False)
 
 def create_case(customer, broker, port, eta, uploaded_file):
     df = load_cases()
+
     case_id = f"CUS-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     file_path = ""
 
-    if uploaded_file:
-        file_path = str(UPLOAD_DIR / f"{case_id}_{uploaded_file.name}")
+    if uploaded_file is not None:
+        safe_name = uploaded_file.name.replace(" ", "_")
+        file_path = str(UPLOAD_DIR / f"{case_id}_{safe_name}")
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
     new_case = {
         "case_id": case_id,
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "customer": customer,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "customer": customer.strip(),
         "broker": broker,
-        "port": port,
-        "eta": eta,
+        "port": port.strip(),
+        "eta": eta.strftime("%Y-%m-%d"),
         "manifest_file": file_path,
         "status": "New",
         "op_note": "",
@@ -75,7 +81,7 @@ if role == "Customer Portal":
     st.header("Customer Portal")
     st.subheader("Create New Clearance Case")
 
-    with st.form("new_case_form"):
+    with st.form("new_case_form", clear_on_submit=False):
         col1, col2 = st.columns(2)
         with col1:
             customer = st.text_input("Customer / Importer", "ABC Import LLC")
@@ -84,20 +90,40 @@ if role == "Customer Portal":
             broker = st.selectbox("Assigned Broker", ["Theo Customs", "Boston Broker", "NY Broker"])
             eta = st.date_input("ETA")
 
-        uploaded_file = st.file_uploader("Upload Manifest / Invoice / Packing List", type=["csv", "xlsx", "pdf"])
-        submitted = st.form_submit_button("Submit Case")
+        uploaded_file = st.file_uploader(
+            "Upload Manifest / Invoice / Packing List",
+            type=["csv", "xlsx", "pdf"]
+        )
 
-        if submitted:
-            case_id = create_case(customer, broker, port, eta, uploaded_file)
-            st.success(f"Case created: {case_id}")
+        submitted = st.form_submit_button("Submit Case", type="primary")
 
-    st.subheader("My Cases")
-    st.dataframe(df, use_container_width=True)
+    if submitted:
+        try:
+            if not customer.strip():
+                st.error("Customer / Importer cannot be empty.")
+            elif not port.strip():
+                st.error("Port cannot be empty.")
+            else:
+                case_id = create_case(customer, broker, port, eta, uploaded_file)
+                st.success(f"Case created successfully: {case_id}")
+                st.balloons()
+                df = load_cases()
+        except Exception:
+            st.error("Submit failed. Full error below:")
+            st.code(traceback.format_exc())
+
+    st.subheader("All Cases")
+    df = load_cases()
+    if df.empty:
+        st.info("No cases yet.")
+    else:
+        st.dataframe(df, use_container_width=True)
 
 elif role == "Broker Dashboard":
     st.header("Broker Dashboard")
     st.caption("Broker 在这里接收案件、更新清关状态、上传 Entry 信息。")
 
+    df = load_cases()
     if df.empty:
         st.info("No cases yet.")
     else:
@@ -111,15 +137,13 @@ elif role == "Broker Dashboard":
 
         st.write("Current Status:", row["status"])
 
-        new_status = st.selectbox(
-            "Update Clearance Status",
-            ["New", "Documents Received", "Waiting Customer Info", "Entry Filed", "Customs Hold", "Released", "Closed"],
-            index=["New", "Documents Received", "Waiting Customer Info", "Entry Filed", "Customs Hold", "Released", "Closed"].index(row["status"]) if row["status"] in ["New", "Documents Received", "Waiting Customer Info", "Entry Filed", "Customs Hold", "Released", "Closed"] else 0
-        )
+        statuses = ["New", "Documents Received", "Waiting Customer Info", "Entry Filed", "Customs Hold", "Released", "Closed"]
+        current_index = statuses.index(row["status"]) if row["status"] in statuses else 0
 
-        note = st.text_area("Broker / OP Note", value=str(row["op_note"]) if pd.notna(row["op_note"]) else "")
+        new_status = st.selectbox("Update Clearance Status", statuses, index=current_index)
+        note = st.text_area("Broker / OP Note", value="" if pd.isna(row["op_note"]) else str(row["op_note"]))
 
-        if st.button("Save Broker Update"):
+        if st.button("Save Broker Update", type="primary"):
             df.loc[df["case_id"] == selected, "status"] = new_status
             df.loc[df["case_id"] == selected, "op_note"] = note
             save_cases(df)
@@ -129,15 +153,14 @@ elif role == "OP Dashboard":
     st.header("OP Dashboard")
     st.caption("运营查看所有 shipment 状态、异常、SLA。")
 
+    df = load_cases()
     if df.empty:
         st.info("No cases yet.")
     else:
-        status_filter = st.multiselect(
-            "Filter by Status",
-            sorted(df["status"].dropna().unique().tolist()),
-            default=sorted(df["status"].dropna().unique().tolist())
-        )
+        status_list = sorted(df["status"].dropna().unique().tolist())
+        status_filter = st.multiselect("Filter by Status", status_list, default=status_list)
         filtered = df[df["status"].isin(status_filter)]
+
         st.dataframe(
             filtered[["case_id", "created_at", "customer", "broker", "port", "eta", "status", "op_note"]],
             use_container_width=True
@@ -150,6 +173,7 @@ elif role == "Billing Dashboard":
     st.header("Billing Dashboard")
     st.caption("财务根据 case 自动计算 broker fee、duty、MPF，并生成账单。")
 
+    df = load_cases()
     if df.empty:
         st.info("No cases yet.")
     else:
@@ -162,17 +186,18 @@ elif role == "Billing Dashboard":
             mpf = st.number_input("MPF", min_value=0.0, value=float(row["mpf"]))
             billing_status = st.selectbox("Billing Status", ["Pending", "Ready to Bill", "Invoiced", "Paid"])
 
-            submitted = st.form_submit_button("Save Billing")
+            submitted = st.form_submit_button("Save Billing", type="primary")
 
-            if submitted:
-                total = broker_fee + duty + mpf
-                df.loc[df["case_id"] == selected, "broker_fee"] = broker_fee
-                df.loc[df["case_id"] == selected, "duty"] = duty
-                df.loc[df["case_id"] == selected, "mpf"] = mpf
-                df.loc[df["case_id"] == selected, "total"] = total
-                df.loc[df["case_id"] == selected, "billing_status"] = billing_status
-                save_cases(df)
-                st.success(f"Billing updated. Total: ${total:,.2f}")
+        if submitted:
+            total = broker_fee + duty + mpf
+            df.loc[df["case_id"] == selected, "broker_fee"] = broker_fee
+            df.loc[df["case_id"] == selected, "duty"] = duty
+            df.loc[df["case_id"] == selected, "mpf"] = mpf
+            df.loc[df["case_id"] == selected, "total"] = total
+            df.loc[df["case_id"] == selected, "billing_status"] = billing_status
+            save_cases(df)
+            st.success(f"Billing updated. Total: ${total:,.2f}")
+            row = load_cases()[load_cases()["case_id"] == selected].iloc[0]
 
         st.subheader("Invoice Preview")
         invoice = pd.DataFrame([
