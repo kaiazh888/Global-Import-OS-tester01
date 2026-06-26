@@ -78,6 +78,112 @@ def save_moves(df):
     save_csv(df, MOVES_FILE, MOVES_COLS)
 
 
+def normalize_column_name(col):
+    return (
+        str(col)
+        .lower()
+        .strip()
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("/", "_")
+        .replace(".", "")
+    )
+
+
+def read_manifest_file(file_path):
+    file_path = str(file_path).lower()
+
+    if file_path.endswith(".csv"):
+        return pd.read_csv(file_path)
+
+    if file_path.endswith(".xlsx") or file_path.endswith(".xls"):
+        return pd.read_excel(file_path)
+
+    return pd.DataFrame()
+
+
+def parse_manifest_lastmile(file_path, case_id):
+    df = read_manifest_file(file_path)
+
+    if df.empty:
+        return pd.DataFrame(columns=LASTMILE_COLS)
+
+    original_columns = list(df.columns)
+    df.columns = [normalize_column_name(c) for c in df.columns]
+
+    lastmile_candidates = [
+        "last_mile",
+        "lastmile",
+        "last_mile_provider",
+        "last_mile_carrier",
+        "carrier",
+        "carrier_name",
+        "dsp",
+        "delivery_provider",
+        "service_provider",
+        "provider",
+        "lastmile_provider",
+        "lm",
+        "route",
+        "route_code",
+        "destination",
+        "delivery_company",
+        "courier",
+    ]
+
+    ctn_candidates = [
+        "ctns",
+        "ctn",
+        "cartons",
+        "carton",
+        "boxes",
+        "box",
+        "pcs",
+        "pieces",
+        "piece",
+        "qty",
+        "quantity",
+        "package_qty",
+        "packages",
+        "package_count",
+        "count",
+    ]
+
+    lastmile_col = next((c for c in lastmile_candidates if c in df.columns), None)
+    ctn_col = next((c for c in ctn_candidates if c in df.columns), None)
+
+    if not lastmile_col:
+        return pd.DataFrame(columns=LASTMILE_COLS)
+
+    df[lastmile_col] = df[lastmile_col].astype(str).str.strip()
+    df = df[df[lastmile_col] != ""]
+    df = df[df[lastmile_col].str.lower() != "nan"]
+
+    if df.empty:
+        return pd.DataFrame(columns=LASTMILE_COLS)
+
+    if ctn_col:
+        df[ctn_col] = pd.to_numeric(df[ctn_col], errors="coerce").fillna(0)
+        result = df.groupby(lastmile_col, dropna=False)[ctn_col].sum().reset_index()
+        result.columns = ["lastmile", "total_ctns"]
+    else:
+        result = df.groupby(lastmile_col, dropna=False).size().reset_index(name="total_ctns")
+        result.columns = ["lastmile", "total_ctns"]
+
+    result["total_ctns"] = pd.to_numeric(result["total_ctns"], errors="coerce").fillna(0).astype(int)
+    result = result[result["total_ctns"] > 0]
+
+    if result.empty:
+        return pd.DataFrame(columns=LASTMILE_COLS)
+
+    result["case_id"] = case_id
+    result["weight_lbs"] = 0.0
+    result["rate"] = 0.0
+    result["amount"] = 0.0
+
+    return result[LASTMILE_COLS]
+
+
 def download_manifest(case_row):
     file_path = str(case_row.get("manifest_file", ""))
     if file_path and Path(file_path).exists():
@@ -87,7 +193,7 @@ def download_manifest(case_row):
                 data=f,
                 file_name=Path(file_path).name,
                 mime="application/octet-stream",
-                key=f"download_{case_row['case_id']}_{st.session_state.get('role_key','')}"
+                key=f"download_{case_row['case_id']}_{st.session_state.get('role_key', '')}"
             )
     else:
         st.warning("No manifest file uploaded.")
@@ -95,6 +201,7 @@ def download_manifest(case_row):
 
 def create_case(mawb, customer, broker, port, eta, uploaded_file):
     cases = load_cases()
+
     case_id = f"CUS-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     file_path = ""
 
@@ -120,6 +227,15 @@ def create_case(mawb, customer, broker, port, eta, uploaded_file):
 
     cases = pd.concat([cases, pd.DataFrame([new_case])], ignore_index=True)
     save_cases(cases)
+
+    if file_path:
+        parsed_lm = parse_manifest_lastmile(file_path, case_id)
+        if not parsed_lm.empty:
+            lm = load_lastmile()
+            lm = lm[lm["case_id"] != case_id]
+            lm = pd.concat([lm, parsed_lm], ignore_index=True)
+            save_lastmile(lm)
+
     return case_id
 
 
@@ -144,20 +260,24 @@ def get_case_lastmile(case_id):
     case_lm["shipped_ctns"] = case_lm["shipped_ctns"].fillna(0).astype(int)
     case_lm["remaining_ctns"] = case_lm["total_ctns"].astype(int) - case_lm["shipped_ctns"]
     case_lm["amount"] = case_lm["weight_lbs"] * case_lm["rate"]
+
     return case_lm
 
 
 st.set_page_config(page_title="Customs Workflow MVP", layout="wide")
+
 st.title("Customs Workflow Platform - MVP")
-st.caption("客户上传 Manifest → Broker 清关 → OP 按 Last Mile 出货 → Billing 按 Last Mile 计费")
+st.caption("客户上传 Manifest → 自动识别 Last Mile 箱数 → Broker 清关 → OP 出货 → Billing 计费")
 
 role = st.sidebar.selectbox(
     "选择角色",
     ["Customer Portal", "Broker Dashboard", "OP Dashboard", "Billing Dashboard"]
 )
+
 st.session_state["role_key"] = role
 
 cases = load_cases()
+
 
 if role == "Customer Portal":
     st.header("Customer Portal")
@@ -176,7 +296,7 @@ if role == "Customer Portal":
 
         uploaded_file = st.file_uploader(
             "Upload Manifest / Invoice / Packing List",
-            type=["csv", "xlsx", "pdf"]
+            type=["csv", "xlsx", "xls", "pdf"]
         )
 
         submitted = st.form_submit_button("Submit Case", type="primary")
@@ -192,12 +312,25 @@ if role == "Customer Portal":
             else:
                 case_id = create_case(mawb, customer, broker, port, eta, uploaded_file)
                 st.success(f"Case created: {case_id}")
+
+                parsed = get_case_lastmile(case_id)
+                if not parsed.empty:
+                    st.info("Manifest parsed successfully. Last Mile CTNS were created automatically.")
+                    st.dataframe(
+                        parsed[["lastmile", "total_ctns"]],
+                        use_container_width=True
+                    )
+                else:
+                    st.warning("Case created, but no Last Mile CTNS were detected from the manifest. You can add them manually in OP Dashboard.")
+
                 cases = load_cases()
+
         except Exception:
             st.error("Submit failed.")
             st.code(traceback.format_exc())
 
     st.subheader("Cases")
+
     if cases.empty:
         st.info("No cases yet.")
     else:
@@ -205,6 +338,7 @@ if role == "Customer Portal":
 
         selected = st.selectbox("Select case to download manifest", cases["case_id"].tolist())
         row = cases[cases["case_id"] == selected].iloc[0]
+
         download_manifest(row)
 
 
@@ -225,6 +359,17 @@ elif role == "Broker Dashboard":
 
         download_manifest(row)
 
+        st.subheader("Detected Last Mile CTNS")
+        case_lm = get_case_lastmile(selected)
+
+        if case_lm.empty:
+            st.info("No Last Mile data detected yet.")
+        else:
+            st.dataframe(
+                case_lm[["lastmile", "total_ctns", "shipped_ctns", "remaining_ctns"]],
+                use_container_width=True
+            )
+
         statuses = [
             "New",
             "Documents Received",
@@ -238,7 +383,11 @@ elif role == "Broker Dashboard":
         current_index = statuses.index(row["status"]) if row["status"] in statuses else 0
 
         new_status = st.selectbox("Clearance Status", statuses, index=current_index)
-        note = st.text_area("Broker / OP Note", value="" if pd.isna(row["op_note"]) else str(row["op_note"]))
+
+        note = st.text_area(
+            "Broker / OP Note",
+            value="" if pd.isna(row["op_note"]) else str(row["op_note"])
+        )
 
         if st.button("Save Broker Update", type="primary"):
             cases.loc[cases["case_id"] == selected, "status"] = new_status
@@ -265,13 +414,24 @@ elif role == "OP Dashboard":
         download_manifest(row)
 
         st.subheader("Last Mile Plan")
+
         lm = load_lastmile()
         case_lm = get_case_lastmile(selected)
 
+        if case_lm.empty:
+            st.warning("No Last Mile plan found. Add it manually below.")
+        else:
+            st.dataframe(
+                case_lm[["lastmile", "total_ctns", "shipped_ctns", "remaining_ctns"]],
+                use_container_width=True
+            )
+
         with st.form("add_lastmile_form"):
             c1, c2 = st.columns(2)
+
             with c1:
                 lastmile = st.text_input("Last Mile", "SpeedX")
+
             with c2:
                 total_ctns = st.number_input("Total CTNS for this Last Mile", min_value=0, step=1)
 
@@ -282,6 +442,7 @@ elif role == "OP Dashboard":
                 st.error("Last Mile cannot be empty.")
             else:
                 mask = (lm["case_id"] == selected) & (lm["lastmile"] == lastmile.strip())
+
                 if mask.any():
                     lm.loc[mask, "total_ctns"] = int(total_ctns)
                 else:
@@ -294,28 +455,27 @@ elif role == "OP Dashboard":
                         "amount": 0,
                     }
                     lm = pd.concat([lm, pd.DataFrame([new_lm])], ignore_index=True)
+
                 save_lastmile(lm)
                 st.success("Last Mile plan saved.")
-                case_lm = get_case_lastmile(selected)
 
-        if case_lm.empty:
-            st.info("No last mile plan yet.")
-        else:
-            st.dataframe(
-                case_lm[["lastmile", "total_ctns", "shipped_ctns", "remaining_ctns"]],
-                use_container_width=True
-            )
+        case_lm = get_case_lastmile(selected)
 
+        if not case_lm.empty:
             st.subheader("Record Outbound Movement")
+
             moves = load_moves()
             lastmile_options = case_lm["lastmile"].tolist()
 
             with st.form("move_form"):
                 c1, c2, c3 = st.columns(3)
+
                 with c1:
                     move_lastmile = st.selectbox("Which Last Mile", lastmile_options)
+
                 with c2:
                     move_time = st.datetime_input("Outbound Time", datetime.now())
+
                 with c3:
                     ctns_out = st.number_input("CTNS Out", min_value=0, step=1)
 
@@ -332,6 +492,7 @@ elif role == "OP Dashboard":
                     st.error(f"Cannot ship {ctns_out} CTNS. Remaining only {remaining}.")
                 else:
                     move_id = f"MOVE-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
                     new_move = {
                         "move_id": move_id,
                         "case_id": selected,
@@ -340,13 +501,16 @@ elif role == "OP Dashboard":
                         "ctns_out": int(ctns_out),
                         "note": move_note,
                     }
+
                     moves = pd.concat([moves, pd.DataFrame([new_move])], ignore_index=True)
                     save_moves(moves)
                     st.success("Outbound movement saved.")
 
             st.subheader("Outbound History")
+
             moves = load_moves()
             case_moves = moves[moves["case_id"] == selected].copy()
+
             if case_moves.empty:
                 st.info("No outbound movements yet.")
             else:
@@ -356,6 +520,7 @@ elif role == "OP Dashboard":
                 )
 
             st.subheader("Updated Remaining")
+
             st.dataframe(
                 get_case_lastmile(selected)[["lastmile", "total_ctns", "shipped_ctns", "remaining_ctns"]],
                 use_container_width=True
@@ -382,12 +547,20 @@ elif role == "Billing Dashboard":
         case_lm = get_case_lastmile(selected)
 
         if case_lm.empty:
-            st.warning("No last mile data yet. OP needs to add Last Mile plan first.")
+            st.warning("No Last Mile data yet. OP needs to add Last Mile plan first.")
         else:
             st.subheader("Billing by Last Mile")
 
             edited = st.data_editor(
-                case_lm[["lastmile", "total_ctns", "shipped_ctns", "remaining_ctns", "weight_lbs", "rate", "amount"]],
+                case_lm[[
+                    "lastmile",
+                    "total_ctns",
+                    "shipped_ctns",
+                    "remaining_ctns",
+                    "weight_lbs",
+                    "rate",
+                    "amount"
+                ]],
                 column_config={
                     "lastmile": st.column_config.TextColumn("Last Mile", disabled=True),
                     "total_ctns": st.column_config.NumberColumn("Total CTNS", disabled=True),
@@ -402,11 +575,15 @@ elif role == "Billing Dashboard":
                 key="billing_editor"
             )
 
-            billing_status = st.selectbox("Billing Status", ["Pending", "Ready to Bill", "Invoiced", "Paid"])
+            billing_status = st.selectbox(
+                "Billing Status",
+                ["Pending", "Ready to Bill", "Invoiced", "Paid"]
+            )
 
             if st.button("Save Billing", type="primary"):
                 for _, r in edited.iterrows():
                     mask = (lm["case_id"] == selected) & (lm["lastmile"] == r["lastmile"])
+
                     lm.loc[mask, "weight_lbs"] = float(r["weight_lbs"])
                     lm.loc[mask, "rate"] = float(r["rate"])
                     lm.loc[mask, "amount"] = float(r["weight_lbs"]) * float(r["rate"])
@@ -419,7 +596,9 @@ elif role == "Billing Dashboard":
                 st.success("Billing saved.")
 
             refreshed = get_case_lastmile(selected)
-            total_amount = float((refreshed["weight_lbs"] * refreshed["rate"]).sum())
+            refreshed["amount"] = refreshed["weight_lbs"] * refreshed["rate"]
+
+            total_amount = float(refreshed["amount"].sum())
             total_weight = float(refreshed["weight_lbs"].sum())
             total_ctns = int(refreshed["total_ctns"].sum())
 
@@ -429,6 +608,15 @@ elif role == "Billing Dashboard":
             c3.metric("Total Amount", f"${total_amount:,.2f}")
 
             st.subheader("Invoice Preview")
-            invoice = refreshed[["lastmile", "total_ctns", "weight_lbs", "rate"]].copy()
-            invoice["amount"] = invoice["weight_lbs"] * invoice["rate"]
+
+            invoice = refreshed[[
+                "lastmile",
+                "total_ctns",
+                "shipped_ctns",
+                "remaining_ctns",
+                "weight_lbs",
+                "rate",
+                "amount"
+            ]].copy()
+
             st.dataframe(invoice, use_container_width=True)
