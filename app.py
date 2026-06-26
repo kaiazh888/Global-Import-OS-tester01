@@ -108,10 +108,10 @@ def parse_manifest_lastmile(file_path, case_id):
     if df.empty:
         return pd.DataFrame(columns=LASTMILE_COLS)
 
-    original_columns = list(df.columns)
     df.columns = [normalize_column_name(c) for c in df.columns]
 
     lastmile_candidates = [
+        "last_mile_service",
         "last_mile",
         "lastmile",
         "last_mile_provider",
@@ -129,6 +129,19 @@ def parse_manifest_lastmile(file_path, case_id):
         "destination",
         "delivery_company",
         "courier",
+    ]
+
+    box_id_candidates = [
+        "no_large_box",
+        "large_box",
+        "large_box_no",
+        "box_no",
+        "box_number",
+        "carton_no",
+        "carton_number",
+        "ctn_no",
+        "ctn_number",
+        "container_box",
     ]
 
     ctn_candidates = [
@@ -150,6 +163,7 @@ def parse_manifest_lastmile(file_path, case_id):
     ]
 
     lastmile_col = next((c for c in lastmile_candidates if c in df.columns), None)
+    box_id_col = next((c for c in box_id_candidates if c in df.columns), None)
     ctn_col = next((c for c in ctn_candidates if c in df.columns), None)
 
     if not lastmile_col:
@@ -162,19 +176,41 @@ def parse_manifest_lastmile(file_path, case_id):
     if df.empty:
         return pd.DataFrame(columns=LASTMILE_COLS)
 
-    if ctn_col:
-        df[ctn_col] = pd.to_numeric(df[ctn_col], errors="coerce").fillna(0)
-        result = df.groupby(lastmile_col, dropna=False)[ctn_col].sum().reset_index()
+    # 优先逻辑：如果有箱号列，按箱号去重算箱数
+    if box_id_col:
+        df[box_id_col] = df[box_id_col].astype(str).str.strip()
+        df = df[df[box_id_col] != ""]
+        df = df[df[box_id_col].str.lower() != "nan"]
+
+        result = (
+            df.groupby(lastmile_col)[box_id_col]
+            .nunique()
+            .reset_index()
+        )
         result.columns = ["lastmile", "total_ctns"]
+
+    # 第二逻辑：如果没有箱号列，但有 CTNS/QTY 列，就按数量求和
+    elif ctn_col:
+        df[ctn_col] = pd.to_numeric(df[ctn_col], errors="coerce").fillna(0)
+
+        result = (
+            df.groupby(lastmile_col)[ctn_col]
+            .sum()
+            .reset_index()
+        )
+        result.columns = ["lastmile", "total_ctns"]
+
+    # 第三逻辑：如果什么数量列都没有，就按行数算
     else:
-        result = df.groupby(lastmile_col, dropna=False).size().reset_index(name="total_ctns")
+        result = (
+            df.groupby(lastmile_col)
+            .size()
+            .reset_index(name="total_ctns")
+        )
         result.columns = ["lastmile", "total_ctns"]
 
     result["total_ctns"] = pd.to_numeric(result["total_ctns"], errors="coerce").fillna(0).astype(int)
     result = result[result["total_ctns"] > 0]
-
-    if result.empty:
-        return pd.DataFrame(columns=LASTMILE_COLS)
 
     result["case_id"] = case_id
     result["weight_lbs"] = 0.0
