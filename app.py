@@ -91,12 +91,16 @@ def normalize_column_name(col):
 
 
 def read_manifest_file(file_path):
-    file_path = str(file_path).lower()
+    file_path = str(file_path)
+    lower_path = file_path.lower()
 
-    if file_path.endswith(".csv"):
+    if not Path(file_path).exists():
+        return pd.DataFrame()
+
+    if lower_path.endswith(".csv"):
         return pd.read_csv(file_path)
 
-    if file_path.endswith(".xlsx") or file_path.endswith(".xls"):
+    if lower_path.endswith(".xlsx") or lower_path.endswith(".xls"):
         return pd.read_excel(file_path)
 
     return pd.DataFrame()
